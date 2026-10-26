@@ -18,7 +18,10 @@ a 0-48 hour weather-risk heatmap.
    included). ETA at a checkpoint = departure + route duration x fraction of
    distance covered.
 4. **Weather** (Open-Meteo hourly wind, rain, snowfall) at each checkpoint,
-   read at the hour nearest its ETA.
+   read at the hour nearest its ETA. Open-Meteo's free tier is limited per IP,
+   so after a 429 the app switches to MET Norway for ten minutes. MET reports
+   total precipitation only; it is counted as snow at or below 0 °C, using a
+   10:1 snow-to-liquid ratio.
 5. **Risk** per checkpoint = worst of wind / rain / snow band, then the load rules.
 6. **Recommendation** ranks routes by, in order: fewest No Travel miles, fewest
    Severe miles, fewest High miles, lowest average risk, shortest time.
@@ -44,7 +47,8 @@ halfway to its neighbours, so the per-level miles add up to the route length.
   are car-like, not truck-specific. Routing, geocoding and weather results are
   cached in memory; for real traffic, swap in a self-hosted OSRM or a truck
   routing provider by changing `planner/providers.py` only.
-- Forecast data reaches 16 days ahead, so later departures are rejected with a message.
+- Forecast data reaches 16 days ahead (about 9 on the MET Norway fallback),
+  so later departures are rejected with a message.
 
 ## Run locally
 

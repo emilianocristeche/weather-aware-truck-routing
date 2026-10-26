@@ -1,4 +1,5 @@
-"""Third-party API clients: Photon / Nominatim (geocoding), OSRM (routing), Open-Meteo (weather).
+"""Third-party API clients: Photon / Nominatim (geocoding), OSRM (routing),
+Open-Meteo / MET Norway (weather).
 
 None of them needs an API key. All results are cached in-process, which keeps
 repeat requests fast and stays well inside the public services' usage policies.
@@ -16,7 +17,7 @@ import requests
 
 from .geo import overlap_ratio
 
-USER_AGENT = "spotter-truck-routing/1.0 (assessment project)"
+USER_AGENT = "weather-aware-truck-routing/1.0 github.com/emilianocristeche/weather-aware-truck-routing"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 PHOTON_URL = "https://photon.komoot.io/api/"
 OPEN_METEO_GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
@@ -196,42 +197,51 @@ def route_options(origin, destination, wanted=3):
 
 
 # ---------------------------------------------------------------- weather
+#
+# Open-Meteo is the primary source: one request covers 40 points and gives
+# rain and snowfall separately. Its free tier is limited per IP, which shared
+# cloud hosts exhaust quickly, so after a 429 we switch to MET Norway (one
+# request per point) for a while.
 
 _weather_cache = {}
 _weather_lock = threading.Lock()
 WEATHER_TTL_S = 15 * 60
 BATCH = 40
+OPEN_METEO_COOLDOWN_S = 10 * 60
+_open_meteo_paused_until = 0.0
+
+MET_URL = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
+MM_PER_INCH = 25.4
+SNOW_TO_LIQUID = 10  # inches of snow per inch of melted precipitation
+MPH_PER_MS = 2.23694
 
 
-def _fetch_batch(points, forecast_days):
-    resp = None
-    for attempt in range(3):
-        try:
-            resp = _session.get(
-                OPEN_METEO_URL,
-                params={
-                    "latitude": ",".join(f"{lat:.2f}" for lat, _ in points),
-                    "longitude": ",".join(f"{lon:.2f}" for _, lon in points),
-                    "hourly": "wind_speed_10m,rain,showers,snowfall",
-                    "wind_speed_unit": "mph",
-                    "precipitation_unit": "inch",
-                    "timezone": "GMT",
-                    "past_days": 1,
-                    "forecast_days": forecast_days,
-                },
-                timeout=TIMEOUT,
-            )
-            if resp.status_code == 429:
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            resp.raise_for_status()
-            break
-        except requests.RequestException as exc:
-            if attempt == 2:
-                raise ProviderError(f"Weather service unavailable: {exc}") from exc
-            time.sleep(1)
-    else:
-        raise ProviderError("Weather service is rate limiting us; try again shortly.")
+class RateLimited(ProviderError):
+    pass
+
+
+def _open_meteo_batch(points, forecast_days):
+    try:
+        resp = _session.get(
+            OPEN_METEO_URL,
+            params={
+                "latitude": ",".join(f"{lat:.2f}" for lat, _ in points),
+                "longitude": ",".join(f"{lon:.2f}" for _, lon in points),
+                "hourly": "wind_speed_10m,rain,showers,snowfall",
+                "wind_speed_unit": "mph",
+                "precipitation_unit": "inch",
+                "timezone": "GMT",
+                "past_days": 1,
+                "forecast_days": forecast_days,
+            },
+            timeout=TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        raise ProviderError(f"Weather service unavailable: {exc}") from exc
+    if resp.status_code == 429:
+        raise RateLimited("Open-Meteo rate limit reached.")
+    if not resp.ok:
+        raise ProviderError(f"Weather service error ({resp.status_code}).")
 
     payload = resp.json()
     if isinstance(payload, dict):
@@ -250,6 +260,83 @@ def _fetch_batch(points, forecast_days):
     return series
 
 
+def _parse_utc(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _met_point(point):
+    """MET Norway forecast for one point, expanded to an hourly series.
+
+    MET reports hourly steps for the first ~2.5 days, then 6-hourly ones; a
+    longer step's precipitation is spread evenly over its hours. MET gives total
+    precipitation only, so it counts as snow at or below 0 °C.
+    """
+    lat, lon = point
+    try:
+        resp = _session.get(MET_URL, params={"lat": f"{lat:.2f}", "lon": f"{lon:.2f}"}, timeout=TIMEOUT)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        raise ProviderError(f"Weather service unavailable: {exc}") from exc
+
+    steps = resp.json()["properties"]["timeseries"]
+    start = _parse_utc(steps[0]["time"])
+
+    def hour_of(step):
+        return int((_parse_utc(step["time"]) - start).total_seconds() // 3600)
+
+    hours = hour_of(steps[-1]) + 1
+    wind, rain, snow = [0.0] * hours, [0.0] * hours, [0.0] * hours
+    for i, step in enumerate(steps):
+        first = hour_of(step)
+        last = hour_of(steps[i + 1]) if i + 1 < len(steps) else hours
+        data = step["data"]
+        details = data["instant"]["details"]
+        per_hour = 0.0
+        for key, span in (("next_1_hours", 1), ("next_6_hours", 6), ("next_12_hours", 12)):
+            amount = data.get(key, {}).get("details", {}).get("precipitation_amount")
+            if amount is not None:
+                per_hour = amount / span / MM_PER_INCH
+                break
+        freezing = details.get("air_temperature", 1.0) <= 0
+        for h in range(first, min(last, hours)):
+            wind[h] = details.get("wind_speed", 0.0) * MPH_PER_MS
+            if freezing:
+                snow[h] = per_hour * SNOW_TO_LIQUID
+            else:
+                rain[h] = per_hour
+    return {"start": start, "wind": wind, "rain": rain, "snow": snow}
+
+
+def _fetch(points, forecast_days):
+    """Series for `points`, from Open-Meteo when allowed, else MET Norway."""
+    global _open_meteo_paused_until
+    fetched, leftover = {}, []
+
+    if time.monotonic() >= _open_meteo_paused_until:
+        def run(batch):
+            try:
+                return batch, _open_meteo_batch(batch, forecast_days)
+            except RateLimited:
+                return batch, None
+
+        batches = [points[i : i + BATCH] for i in range(0, len(points), BATCH)]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for batch, series in pool.map(run, batches):
+                if series is None:
+                    leftover += batch
+                else:
+                    fetched.update(zip(batch, series))
+        if leftover:
+            _open_meteo_paused_until = time.monotonic() + OPEN_METEO_COOLDOWN_S
+    else:
+        leftover = list(points)
+
+    if leftover:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            fetched.update(zip(leftover, pool.map(_met_point, leftover)))
+    return fetched
+
+
 def hourly_weather(points, forecast_days):
     """Hourly wind/rain/snow for each (lat, lon), keyed by the rounded point."""
     now = time.monotonic()
@@ -263,13 +350,10 @@ def hourly_weather(points, forecast_days):
             else:
                 missing.append(key)
 
-    batches = [missing[i : i + BATCH] for i in range(0, len(missing), BATCH)]
-    if batches:
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            fetched = list(pool.map(lambda b: _fetch_batch(b, forecast_days), batches))
+    if missing:
+        fetched = _fetch(missing, forecast_days)
         with _weather_lock:
-            for batch, series in zip(batches, fetched):
-                for key, data in zip(batch, series):
-                    _weather_cache[(key, forecast_days)] = (now, data)
-                    result[key] = data
+            for key, data in fetched.items():
+                _weather_cache[(key, forecast_days)] = (now, data)
+        result.update(fetched)
     return result

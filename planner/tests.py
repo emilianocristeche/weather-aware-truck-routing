@@ -182,3 +182,43 @@ class GeocodeFallbackTests(TestCase):
 
     def test_coordinates_skip_geocoding(self):
         self.assertEqual(providers.geocode("40.5, -100.25")[:2], (40.5, -100.25))
+
+
+class MetNorwayTests(TestCase):
+    def _response(self, timeseries):
+        resp = mock.Mock()
+        resp.json.return_value = {"properties": {"timeseries": timeseries}}
+        resp.raise_for_status.return_value = None
+        return resp
+
+    def test_expands_six_hour_steps_and_splits_snow_by_temperature(self):
+        timeseries = [
+            {"time": "2026-10-27T00:00:00Z", "data": {
+                "instant": {"details": {"wind_speed": 10.0, "air_temperature": 5.0}},
+                "next_1_hours": {"details": {"precipitation_amount": 2.54}}}},
+            {"time": "2026-10-27T01:00:00Z", "data": {
+                "instant": {"details": {"wind_speed": 20.0, "air_temperature": -3.0}},
+                "next_6_hours": {"details": {"precipitation_amount": 15.24}}}},
+            {"time": "2026-10-27T07:00:00Z", "data": {
+                "instant": {"details": {"wind_speed": 0.0, "air_temperature": 2.0}}}},
+        ]
+        with mock.patch.object(providers._session, "get", return_value=self._response(timeseries)):
+            series = providers._met_point((40.0, -100.0))
+        self.assertEqual(len(series["wind"]), 8)
+        self.assertAlmostEqual(series["rain"][0], 0.1)  # 2.54 mm in one hour
+        self.assertAlmostEqual(series["wind"][0], 22.37, places=2)
+        # 15.24 mm over 6 freezing hours = 0.1 in/hr liquid = 1.0 in/hr of snow.
+        self.assertAlmostEqual(series["snow"][3], 1.0)
+        self.assertEqual(series["rain"][3], 0.0)
+        self.assertEqual(series["rain"][7], 0.0)
+
+    def test_switches_to_met_after_open_meteo_rate_limit(self):
+        providers._open_meteo_paused_until = 0.0
+        met = {"start": None, "wind": [0.0], "rain": [0.0], "snow": [0.0]}
+        with mock.patch.object(providers, "_open_meteo_batch", side_effect=providers.RateLimited("429")), \
+                mock.patch.object(providers, "_met_point", return_value=met) as met_point:
+            fetched = providers._fetch([(1.0, 2.0), (3.0, 4.0)], 3)
+        self.assertEqual(met_point.call_count, 2)
+        self.assertEqual(set(fetched), {(1.0, 2.0), (3.0, 4.0)})
+        self.assertGreater(providers._open_meteo_paused_until, 0)
+        providers._open_meteo_paused_until = 0.0
