@@ -8,7 +8,9 @@ a 0-48 hour weather-risk heatmap.
 
 ## How it works
 
-1. **Geocode** origin and destination (Nominatim). A literal `lat,lon` also works.
+1. **Geocode** origin and destination (Photon, falling back to Nominatim and
+   Open-Meteo, since public geocoders rate-limit shared cloud IPs). A literal
+   `lat,lon` also works.
 2. **Routes**: ask OSRM for alternatives. When it returns fewer than three, extra
    routes are steered through a waypoint beside the corridor; near-duplicates
    (>=90% overlap) are dropped.
@@ -77,7 +79,7 @@ reason. Errors are `{ "error": "..." }` with a 4xx/5xx status.
 
 ```
 planner/risk.py       thresholds and load rules (pure functions)
-planner/providers.py  Nominatim, OSRM, Open-Meteo clients + caching
+planner/providers.py  geocoding, OSRM, Open-Meteo clients + caching
 planner/service.py    checkpoints, evaluation, ranking, request validation
 planner/tests.py      unit tests
 frontend/src/         React + Leaflet UI (MapView, HeatLayer, RoutePanel)

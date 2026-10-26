@@ -1,4 +1,4 @@
-"""Third-party API clients: Nominatim (geocoding), OSRM (routing), Open-Meteo (weather).
+"""Third-party API clients: Photon / Nominatim (geocoding), OSRM (routing), Open-Meteo (weather).
 
 None of them needs an API key. All results are cached in-process, which keeps
 repeat requests fast and stays well inside the public services' usage policies.
@@ -18,6 +18,8 @@ from .geo import overlap_ratio
 
 USER_AGENT = "spotter-truck-routing/1.0 (assessment project)"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+PHOTON_URL = "https://photon.komoot.io/api/"
+OPEN_METEO_GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 OSRM_URL = os.environ.get("OSRM_URL", "https://router.project-osrm.org")
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 TIMEOUT = 25
@@ -40,6 +42,56 @@ _geocode_lock = threading.Lock()
 _last_nominatim_call = 0.0
 
 
+def _photon(query):
+    resp = _session.get(PHOTON_URL, params={"q": query, "limit": 1}, timeout=TIMEOUT)
+    resp.raise_for_status()
+    features = resp.json().get("features") or []
+    if not features:
+        return None
+    lon, lat = features[0]["geometry"]["coordinates"]
+    props = features[0]["properties"]
+    parts = [props.get(k) for k in ("name", "state", "country")]
+    return lat, lon, ", ".join(dict.fromkeys(p for p in parts if p))
+
+
+def _nominatim(query):
+    # Nominatim allows at most one request per second.
+    global _last_nominatim_call
+    wait = 1.05 - (time.monotonic() - _last_nominatim_call)
+    if wait > 0:
+        time.sleep(wait)
+    try:
+        resp = _session.get(
+            NOMINATIM_URL,
+            params={"q": query, "format": "jsonv2", "limit": 1},
+            timeout=TIMEOUT,
+        )
+        resp.raise_for_status()
+    finally:
+        _last_nominatim_call = time.monotonic()
+    hits = resp.json()
+    if not hits:
+        return None
+    return float(hits[0]["lat"]), float(hits[0]["lon"]), hits[0]["display_name"]
+
+
+def _open_meteo_geocode(query):
+    # Only understands a bare place name, so drop any ", ST" suffix.
+    name = query.split(",")[0].strip()
+    resp = _session.get(OPEN_METEO_GEOCODE_URL, params={"name": name, "count": 1}, timeout=TIMEOUT)
+    resp.raise_for_status()
+    hits = resp.json().get("results") or []
+    if not hits:
+        return None
+    hit = hits[0]
+    parts = [hit.get("name"), hit.get("admin1"), hit.get("country")]
+    return hit["latitude"], hit["longitude"], ", ".join(p for p in parts if p)
+
+
+# Public geocoders rate-limit shared cloud IPs, so fall through to the next one.
+GEOCODERS = (_photon, _nominatim, _open_meteo_geocode)
+
+
 def geocode(query):
     """Resolve free text (or a literal "lat,lon") to (lat, lon, display_name)."""
     match = _COORD_RE.match(query)
@@ -53,28 +105,19 @@ def geocode(query):
     with _geocode_lock:
         if key in _geocode_cache:
             return _geocode_cache[key]
-        # Nominatim allows at most one request per second.
-        global _last_nominatim_call
-        wait = 1.05 - (time.monotonic() - _last_nominatim_call)
-        if wait > 0:
-            time.sleep(wait)
-        try:
-            resp = _session.get(
-                NOMINATIM_URL,
-                params={"q": query, "format": "jsonv2", "limit": 1},
-                timeout=TIMEOUT,
-            )
-            resp.raise_for_status()
-        except requests.RequestException as exc:
-            raise ProviderError(f"Geocoding service unavailable: {exc}") from exc
-        finally:
-            _last_nominatim_call = time.monotonic()
-        hits = resp.json()
-        if not hits:
-            raise ProviderError(f'Could not find a place called "{query}".', 400)
-        result = (float(hits[0]["lat"]), float(hits[0]["lon"]), hits[0]["display_name"])
-        _geocode_cache[key] = result
-        return result
+        failures = []
+        for geocoder in GEOCODERS:
+            try:
+                result = geocoder(query)
+            except (requests.RequestException, ValueError, KeyError) as exc:
+                failures.append(exc)
+                continue
+            if result:
+                _geocode_cache[key] = result
+                return result
+        if len(failures) == len(GEOCODERS):
+            raise ProviderError(f"Geocoding service unavailable: {failures[-1]}")
+        raise ProviderError(f'Could not find a place called "{query}".', 400)
 
 
 def _osrm(waypoints, alternatives):

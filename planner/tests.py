@@ -1,9 +1,9 @@
 from datetime import datetime, timezone
-from unittest import TestCase
+from unittest import TestCase, mock
 
 from django.test import SimpleTestCase
 
-from . import service
+from . import providers, service
 from .risk import HIGH, LOW, MODERATE, NO_TRAVEL, SEVERE, classify
 
 
@@ -158,3 +158,27 @@ class ValidationTests(SimpleTestCase):
         response = self.client.post("/api/plan", data="{}", content_type="application/json")
         self.assertEqual(response.status_code, 400)
         self.assertIn("error", response.json())
+
+
+class GeocodeFallbackTests(TestCase):
+    def setUp(self):
+        providers._geocode_cache.clear()
+
+    def test_falls_through_to_next_geocoder_on_error(self):
+        import requests
+
+        def broken(query):
+            raise requests.HTTPError("429 Too Many Requests")
+
+        fallback = mock.Mock(return_value=(1.0, 2.0, "Somewhere"))
+        with mock.patch.object(providers, "GEOCODERS", (broken, fallback)):
+            self.assertEqual(providers.geocode("Somewhere"), (1.0, 2.0, "Somewhere"))
+
+    def test_not_found_is_a_client_error(self):
+        with mock.patch.object(providers, "GEOCODERS", (lambda q: None,)):
+            with self.assertRaises(providers.ProviderError) as ctx:
+                providers.geocode("Nowhere at all")
+        self.assertEqual(ctx.exception.status, 400)
+
+    def test_coordinates_skip_geocoding(self):
+        self.assertEqual(providers.geocode("40.5, -100.25")[:2], (40.5, -100.25))
